@@ -1,0 +1,218 @@
+library(DBI)
+library(RSQLite)
+library(nflfastR)
+library(tidyverse)
+library(furrr)
+library(Rcpp)
+
+# Update DB 
+update_db()
+
+
+# ------------------------------ Pull Kicker Meta Data -----------------------------------
+kicking <- pbp_db %>% 
+  filter(!is.na(kicker_player_id),
+         play_type != "kickoff",
+         week <= 16) %>%  
+  mutate(pat.pts = ifelse(extra_point_result == "good", 1, 0),
+         fg.30 = ifelse(field_goal_result == "made" & kick_distance <= 39, 1, 0),
+         fg.40 = ifelse(field_goal_result == "made" & kick_distance >= 40 & kick_distance <= 49, 1, 0),
+         fg.50p = ifelse(field_goal_result == "made" & kick_distance >= 50, 1, 0)) %>%
+  # turn on for missed field goal negative points
+  mutate(fg.miss = case_when(
+    !is.na(field_goal_result) & field_goal_result != "made" ~ 1,
+    TRUE ~ 0
+  )) %>%
+  # turn on for missed PAT negative points
+  mutate(pat.miss = case_when(
+    !is.na(extra_point_result) & extra_point_result %in% c("blocked", "failed") ~ 1,
+    TRUE ~ 0
+  )) %>%
+  mutate(made.fg.yards = ifelse(field_goal_result == "made", kick_distance, 0)) %>% 
+  replace_na(list(pat.pts = 0, fg.pts = 0)) %>% 
+  group_by(season, week, posteam, game_id, kicker_player_id, kicker_player_name) %>% 
+  summarise(pats = sum(pat.pts, na.rm = T),
+            fg.30 = sum(fg.30, na.rm = T),
+            fg.40 = sum(fg.40, na.rm = T),
+            fg.50p = sum(fg.50p, na.rm = T),
+            fg.misses = sum(fg.miss, na.rm = T),
+            pat.misses = sum(pat.miss, na.rm = T),
+            made.fg.distance = sum(made.fg.yards, na.rm = T)) %>% 
+  arrange(desc(season), week) %>% 
+  as.data.frame()
+  
+# --------------- Transform Kicking Meta Data into Weekly Points --------------------
+  
+  kicking.yahoo <- kicking %>% 
+  group_by(game_id, kicker_player_id, kicker_player_name, posteam, season, week) %>% 
+  summarise(pts = 
+            (sum(pats) * 1) +
+            (sum(fg.30) * 3) +
+            (sum(fg.40) * 4) +
+            (sum(fg.50p) * 5)) %>% 
+  mutate(pts = ifelse(is.na(pts), 0, pts))
+  
+  
+  
+  # --------------------------- Pull DST Meta Data --------------------------------
+  
+dst <- pbp_db %>% 
+  filter(play == 1) %>% 
+  select(game_id,season, week, play_type, posteam, defteam, home_team, away_team,
+         home_score, away_score, touchdown, interception, safety,
+         fumble_forced, fumble_lost) %>% 
+  mutate(pick.fum.6 = case_when(
+    interception == 1 & touchdown == 1 ~ 1,
+    fumble_lost == 1 & touchdown == 1 ~ 1,
+    TRUE ~ 0
+  )) %>% 
+  # make safety for plays not on special teams
+  mutate(safety.no.spec.teams = case_when(
+    play_type == "punt" & safety == 1 ~ 1,
+    play_type != "punt" & safety == 1 ~ 0,
+    TRUE ~ 0
+  )) %>% 
+  group_by(game_id, season, week, posteam, defteam, home_team, away_team, home_score, away_score) %>% 
+  summarise(away.pts.allowed = mean(home_score),
+            home.pts.allowed = mean(away_score),
+            to.pts.allowed = sum(pick.fum.6) *6,
+            sfty.pts.allowed = sum(safety.no.spec.teams) *2) %>% 
+  mutate(corrected.pts = case_when(
+    defteam == away_team ~ away_score - to.pts.allowed - sfty.pts.allowed,
+    defteam == home_team ~ home_score - to.pts.allowed - sfty.pts.allowed),  
+    raw.pts = case_when(
+      posteam == home_team ~ away_score,
+      posteam == away_team ~ home_Score)) %>%
+  select(game_id,season, week, defteam, home_team, home_score, away_score, corrected.pts, raw.pts) %>% 
+  
+  
+  # -------- First Join kickoff and field goal return tds -------------
+  
+  
+left_join(
+  pbp_db %>% 
+    mutate(dst.posteam.td = case_when(
+      play_type == "kickoff" & fumble_lost == 0 & touchdown == 1 ~ 1,
+      play_type == "field_goal" & fumble_lost == 0 & interception == 0 & touchdown == 1 ~ 1,
+      TRUE ~ 0)) %>% 
+    filter(dst.posteam.td == 1) %>% 
+    group_by(game_id, posteam, defteam, season, week) %>% 
+    count() %>% 
+    rename(kickoff.tds = n), by = c("defteam", "game_id", "season", "week")) %>% 
+  
+  
+  # ------- Next join punt TDS -----------
+  
+  
+left_join(
+  # Be sure to JOIN ON DEFTEAM - NOT POSTEAM for this query
+  pbp_db %>% 
+    mutate(dst.posteam.td = case_when(
+      play_type == "punt" & fumble_lost == 0 & touchdown == 1 ~ 1,
+      TRUE ~ 0
+    )) %>% 
+    filter(dst.posteam.td == 1) %>% 
+    group_by(game_id, season, week, posteam, defteam) %>% 
+    count() %>% 
+    rename(puntreturn.tds = n), by = c("posteam.x" = "defteam", "game_id", "season", "week")
+) %>% 
+  
+  
+  # ------- Next join blocked FG and PUNTS -----------
+  
+  
+left_join(
+  # Be sure to JOIN ON DEFTEAM - NOT POSTEAM for this query
+  pbp_db %>% 
+    mutate(dst.block = case_when(
+      field_goal_result == "blocked" ~ 1,
+      punt_blocked == 1 ~ 1,
+      TRUE ~ 0
+    )) %>% 
+    filter(dst.block == 1) %>% 
+    group_by(game_id, season, week, posteam, defteam) %>% 
+    count() %>% 
+    rename(dst.blocks = n), by = c("posteam.x" = "defteam", "game_id", "season", "week")
+) %>% 
+  
+  
+  # -------- Join sacks ints fumbles safetys etc. -----------
+  
+  
+left_join(
+  pbp_db %>% 
+    filter(nchar(posteam) > 0,
+           nchar(defteam) > 0) %>% 
+    mutate(def.td = case_when(
+      (fumble_lost == 1 | interception == 1 | field_goal_result == "blocked") & touchdown == 1 ~ 1,
+      TRUE ~ 0
+    )) %>% 
+    group_by(game_id, posteam, defteam, season, week) %>%
+    summarise(
+      tot.sacks = sum(sack, na.rm = T),
+      tot.ints = sum(interception, na.rm = T),
+      tot.sfty = sum(safety, na.rm = T),
+      tot.fumblerec = sum(fumble_lost, na.rm = T),
+      tot.tds = sum(def.td)), by = c("posteam.x" = "defteam", "game_id", "season", "week")
+) %>% 
+  
+  
+  # ---------- Defensive yards allowed ------------------\
+  
+  
+  left_join(
+    pbp_db %>% 
+      filter(play == 1) %>% 
+      group_by(game_id, season, week, posteam, defteam) %>% 
+      summarise(yards.allowed = sum(yards_gained, na.rm = T)), by = c("posteam.x" = "defteam", "game_id", "season", "week")  
+  ) %>% 
+  as.data.frame() %>% 
+  mutate(
+    across(everything(), ~replace_na(.x, 0))
+  )  %>% 
+  select(player_name = posteam.x,
+         game_id, 
+         season, 
+         week,
+         opponent = defteam,
+         home_team,
+         away_team,
+         points.allowed.corrected = corrected.pts,
+         points.allwed.raw = raw.pts,
+         blocks = dst.blocks,
+         sacks = tot.sacks,
+         ints = tot.ints,
+         safeties = tot.sfty,
+         fumble.recoveries = tot.fumblerec,
+         def.tds = tot.tds,
+         kickoff.return.tds = kickoff.tds,
+         punt.return.tds = puntreturn.tds
+  ) %>% 
+  as.data.frame()
+
+
+# Transform DST Meta Data into Weekly Points
+
+
+dst.df <- dst %>% 
+  mutate(pts.allowed = case_when(
+    points.allowed.corrected == 0 ~ 10,
+    points.allowed.corrected > 0 & points.allowed.corrected <= 6 ~ 7,
+    points.allowed.corrected >= 7 & points.allowed.corrected <= 13 ~ 4,
+    points.allowed.corrected >= 14 & points.allowed.corrected <= 20 ~ 1,
+    points.allowed.corrected >= 21 & points.allowed.corrected <= 27 ~ 0,
+    points.allowed.corrected >= 28 & points.allowed.corrected <= 34 ~ -1,
+    points.allowed.corrected >= 35 ~ -4
+  )) %>% 
+  # Create combined points
+  mutate(yahoo =
+           pts.allowed +
+           (sacks * 1) +
+           (ints * 2) +
+           (fumble.recoveries * 2) +
+           (kickoff.return.tds * 6) +
+           (punt.return.tds * 6) +
+           (def.tds * 6) +
+           (safeties * 2) +
+           (blocks * 2)) %>% 
+  select(player_name, game_id, season, week, yahoo)
